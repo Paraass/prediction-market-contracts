@@ -32,12 +32,12 @@ contract WorldCupBettingFuzzTest is Test {
         vm.deal(attacker, 100 ether);
     }
 
-    // ── helpers ────────────────────────────────────────────────────────────────
+    //helpers
 
     function _createMarket() internal returns (uint256 id, uint256 resolution) {
         resolution = block.timestamp + RESOLUTION_OFFSET;
         string[] memory outcomes = new string[](2);
-        outcomes[0] = "YES";
+        outcomes[0] ="YES";
         outcomes[1] = "NO";
         id = market.createMarket(
             "Will Brazil win?", "Match result", outcomes,
@@ -45,7 +45,7 @@ contract WorldCupBettingFuzzTest is Test {
         );
     }
 
-    // ── Fuzz: placeBet amount boundaries ──────────────────────────────────────
+    // Fuzz: placeBet amount boundaries
 
     /// @notice Any nonzero amount up to 10 ETH should be accepted
     function testFuzz_placeBet_anyAmount(uint96 amount) public {
@@ -79,7 +79,7 @@ contract WorldCupBettingFuzzTest is Test {
         market.placeBet{value: amount}(id, 0, amount, minShares);
     }
 
-    // ── Fuzz: payout correctness ───────────────────────────────────────────────
+    // Fuzz: payout correctness 
 
     /// @notice Winner always receives between 0 and totalPool (no value created out of thin air)
     function testFuzz_payout_withinBounds(uint96 stakeA, uint96 stakeB) public {
@@ -110,7 +110,7 @@ contract WorldCupBettingFuzzTest is Test {
         assertGt(received, 0, "Winner got nothing");
     }
 
-    // ── Fuzz: double-claim prevention ─────────────────────────────────────────
+    // Fuzz: double-claim prevention 
 
     function testFuzz_noDoubleClaim(uint96 stake) public {
         vm.assume(stake > 0.001 ether && stake <= 5 ether);
@@ -133,7 +133,7 @@ contract WorldCupBettingFuzzTest is Test {
         market.claimWinnings(betId);
     }
 
-    // ── Fuzz: reentrancy guard ─────────────────────────────────────────────────
+    // Fuzz: reentrancy guard 
 
     function testFuzz_reentrancy_claimWinnings(uint96 stake) public {
         vm.assume(stake > 0.001 ether && stake <= 5 ether);
@@ -160,7 +160,7 @@ contract WorldCupBettingFuzzTest is Test {
         market.claimWinnings(betId);
     }
 
-    // ── Fuzz: time-lock enforcement ────────────────────────────────────────────
+    // Fuzz: time-lock enforcement
 
     function testFuzz_cannotResolveBeforeTime(uint32 timeLeft) public {
         vm.assume(timeLeft > 1);
@@ -190,7 +190,7 @@ contract WorldCupBettingFuzzTest is Test {
         market.placeBet{value: 0.1 ether}(id, 0, 0.1 ether, 0);
     }
 
-    // ── Fuzz: access control ──────────────────────────────────────────────────
+    // Fuzz: access control 
 
     function testFuzz_onlyArbitratorCanResolve(address rando) public {
         vm.assume(rando != oracle && rando != address(0));
@@ -202,7 +202,7 @@ contract WorldCupBettingFuzzTest is Test {
         market.resolveMarket(id, 0);
     }
 
-    // ── Fuzz: fee accounting ──────────────────────────────────────────────────
+    // Fuzz: fee accounting
 
     function testFuzz_feeNeverExceedsPool(uint96 stakeA, uint96 stakeB) public {
         vm.assume(stakeA > 0.001 ether && stakeA <= 5 ether);
@@ -231,7 +231,7 @@ contract WorldCupBettingFuzzTest is Test {
         assertEq(fees, expectedFee, "Fee not exactly 2%");
     }
 
-    // ── Invariant: contract ETH balance always covers unclaimed winnings ───────
+    // Invariant: contract ETH balance always covers unclaimed winnings
 
     function testFuzz_contractBalanceCoversPayouts(uint96 s1, uint96 s2) public {
         vm.assume(s1 > 0.001 ether && s1 <= 3 ether);
@@ -249,7 +249,7 @@ contract WorldCupBettingFuzzTest is Test {
 
         vm.warp(resolution + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0);
+        market.resolveMarket(id,0);
 
         uint256 betId = market.getUserBets(alice)[0];
         vm.prank(alice);
