@@ -4,7 +4,7 @@ pragma solidity ^0.8.30;
 import "forge-std/Test.sol";
 import "../src/WorldCupBettingHardened.sol";
 
-// Minimal reputation system for testing
+// simple mock - just need updateReputation to not revert
 contract MockReputation {
     function updateReputation(address, bool) external {}
     function getReputation(address) external pure returns (uint256) { return 500; }
@@ -12,251 +12,268 @@ contract MockReputation {
 }
 
 contract WorldCupBettingFuzzTest is Test {
-    WorldCupBettingHardened public market;
-    MockReputation public reputation;
 
-    address owner   = address(this);
-    address oracle  = makeAddr("oracle");
-    address alice   = makeAddr("alice");
-    address bob     = makeAddr("bob");
-    address attacker = makeAddr("attacker");
+    WorldCupBettingHardened public betting;
+    MockReputation public rep;
 
-    uint256 constant RESOLUTION_OFFSET = 7 days;
+    // using football fan names to keep it thematic lol
+    address marcos   = makeAddr("marcos");   // brazil fan
+    address priya    = makeAddr("priya");    // argentina fan
+    address exploiter = makeAddr("exploiter"); // bad actor
+    address oracle   = makeAddr("oracle");
+    address me       = address(this);        // contract owner
+
+    uint256 constant ONE_WEEK = 7 days;
 
     function setUp() public {
-        reputation = new MockReputation();
-        market = new WorldCupBettingHardened(address(reputation));
+        rep = new MockReputation();
+        betting = new WorldCupBettingHardened(address(rep));
 
-        vm.deal(alice,   100 ether);
-        vm.deal(bob,     100 ether);
-        vm.deal(attacker, 100 ether);
+        // give everyone some eth to play with
+        vm.deal(marcos, 100 ether);
+        vm.deal(priya, 100 ether);
+        vm.deal(exploiter, 100 ether);
     }
 
-    // ── helpers ────────────────────────────────────────────────────────────────
-
-    function _createMarket() internal returns (uint256 id, uint256 resolution) {
-        resolution = block.timestamp + RESOLUTION_OFFSET;
-        string[] memory outcomes = new string[](2);
-        outcomes[0] = "YES";
-        outcomes[1] = "NO";
-        id = market.createMarket(
-            "Will Brazil win?", "Match result", outcomes,
-            resolution, oracle, address(0)
+    // -----------------------------------------------------------------------
+    // helper - creates a basic yes/no market, returns id and resolution time
+    // -----------------------------------------------------------------------
+    function _openMarket() internal returns (uint256 id, uint256 closesAt) {
+        closesAt = block.timestamp + ONE_WEEK;
+        string[] memory opts = new string[](2);
+        opts[0] = "Brazil wins";
+        opts[1] = "Brazil loses";
+        id = betting.createMarket(
+            "Will Brazil reach the final?",
+            "World Cup 2026 group stage",
+            opts,
+            closesAt,
+            oracle,
+            address(0)
         );
     }
 
-    // ── Fuzz: placeBet amount boundaries ──────────────────────────────────────
-
-    /// @notice Any nonzero amount up to 10 ETH should be accepted
-    function testFuzz_placeBet_anyAmount(uint96 amount) public {
+    // -----------------------------------------------------------------------
+    // bet sizing - any amount from dust to 10 eth should go through
+    // -----------------------------------------------------------------------
+    function testFuzz_anyBetSizeAccepted(uint96 amount) public {
         vm.assume(amount > 0 && amount <= 10 ether);
-        (uint256 id,) = _createMarket();
+        (uint256 id,) = _openMarket();
 
-        vm.prank(alice);
-        uint256 betId = market.placeBet{value: amount}(id, 0, amount, 0);
-        assertGt(betId, 0);
-        assertEq(market.getTotalPool(id), amount);
+        vm.prank(marcos);
+        uint256 betId = betting.placeBet{value: amount}(id, 0, amount, 0);
+
+        assertTrue(betId > 0);
+        assertEq(betting.getTotalPool(id), amount);
     }
 
-    /// @notice minShares == amount should always pass (exact match)
-    function testFuzz_placeBet_exactMinShares(uint96 amount) public {
+    // exact slippage boundary - minShares == amount should be fine
+    function testFuzz_exactSlippageBoundary(uint96 amount) public {
         vm.assume(amount > 0 && amount <= 10 ether);
-        (uint256 id,) = _createMarket();
+        (uint256 id,) = _openMarket();
 
-        vm.prank(alice);
-        market.placeBet{value: amount}(id, 0, amount, amount);
+        vm.prank(marcos);
+        betting.placeBet{value: amount}(id, 0, amount, amount); // should not revert
     }
 
-    /// @notice minShares > amount should always revert
-    function testFuzz_placeBet_slippageReverts(uint96 amount, uint96 minExtra) public {
+    // if you ask for more shares than you get, tx should revert
+    function testFuzz_slippageTooHighReverts(uint96 amount, uint96 extra) public {
         vm.assume(amount > 0 && amount <= 10 ether);
-        vm.assume(minExtra > 0);
-        uint256 minShares = uint256(amount) + uint256(minExtra);
-        (uint256 id,) = _createMarket();
+        vm.assume(extra > 0);
 
-        vm.prank(alice);
+        (uint256 id,) = _openMarket();
+        uint256 greedyMin = uint256(amount) + uint256(extra);
+
+        vm.prank(marcos);
         vm.expectRevert(WorldCupBettingHardened.SlippageExceeded.selector);
-        market.placeBet{value: amount}(id, 0, amount, minShares);
+        betting.placeBet{value: amount}(id, 0, amount, greedyMin);
     }
 
-    // ── Fuzz: payout correctness ───────────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // payout should never exceed what was put in
+    // -----------------------------------------------------------------------
+    function testFuzz_payoutStaysWithinPool(uint96 stakeBrazil, uint96 stakeArgentina) public {
+        vm.assume(stakeBrazil > 0.001 ether && stakeBrazil <= 5 ether);
+        vm.assume(stakeArgentina > 0.001 ether && stakeArgentina <= 5 ether);
 
-    /// @notice Winner always receives between 0 and totalPool (no value created out of thin air)
-    function testFuzz_payout_withinBounds(uint96 stakeA, uint96 stakeB) public {
-        vm.assume(stakeA > 0.001 ether && stakeA <= 5 ether);
-        vm.assume(stakeB > 0.001 ether && stakeB <= 5 ether);
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        (uint256 id, uint256 resolution) = _createMarket();
+        vm.prank(marcos);
+        betting.placeBet{value: stakeBrazil}(id, 0, stakeBrazil, 0);
 
-        vm.prank(alice);
-        market.placeBet{value: stakeA}(id, 0, stakeA, 0);
-        vm.prank(bob);
-        market.placeBet{value: stakeB}(id, 1, stakeB, 0);
+        vm.prank(priya);
+        betting.placeBet{value: stakeArgentina}(id, 1, stakeArgentina, 0);
 
-        vm.warp(resolution + 1);
+        vm.warp(closesAt + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0); // alice wins
+        betting.resolveMarket(id, 0); // brazil wins
 
-        uint256[] memory aliceBets = market.getUserBets(alice);
-        uint256 betId = aliceBets[0];
+        uint256 betId = betting.getUserBets(marcos)[0];
+        uint256 before = marcos.balance;
 
-        uint256 balBefore = alice.balance;
-        vm.prank(alice);
-        market.claimWinnings(betId);
-        uint256 received = alice.balance - balBefore;
+        vm.prank(marcos);
+        betting.claimWinnings(betId);
 
-        uint256 totalPool = uint256(stakeA) + uint256(stakeB);
-        assertLe(received, totalPool, "Payout exceeds total pool");
-        assertGt(received, 0, "Winner got nothing");
+        uint256 received = marcos.balance - before;
+        uint256 pot = uint256(stakeBrazil) + uint256(stakeArgentina);
+
+        assertLe(received, pot, "got more than the pot??");
+        assertGt(received, 0, "winner got nothing");
     }
 
-    // ── Fuzz: double-claim prevention ─────────────────────────────────────────
-
-    function testFuzz_noDoubleClaim(uint96 stake) public {
+    // -----------------------------------------------------------------------
+    // claiming twice should always fail - no free money
+    // -----------------------------------------------------------------------
+    function testFuzz_cantClaimTwice(uint96 stake) public {
         vm.assume(stake > 0.001 ether && stake <= 5 ether);
 
-        (uint256 id, uint256 resolution) = _createMarket();
-        vm.prank(alice);
-        market.placeBet{value: stake}(id, 0, stake, 0);
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        vm.warp(resolution + 1);
+        vm.prank(marcos);
+        betting.placeBet{value: stake}(id, 0, stake, 0);
+
+        vm.warp(closesAt + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
 
-        uint256 betId = market.getUserBets(alice)[0];
+        uint256 betId = betting.getUserBets(marcos)[0];
 
-        vm.prank(alice);
-        market.claimWinnings(betId);
+        vm.prank(marcos);
+        betting.claimWinnings(betId); // fine
 
-        vm.prank(alice);
+        // second attempt - should brick
+        vm.prank(marcos);
         vm.expectRevert(WorldCupBettingHardened.AlreadyClaimed.selector);
-        market.claimWinnings(betId);
+        betting.claimWinnings(betId);
     }
 
-    // ── Fuzz: reentrancy guard ─────────────────────────────────────────────────
-
-    function testFuzz_reentrancy_claimWinnings(uint96 stake) public {
+    // -----------------------------------------------------------------------
+    // reentrancy - simulating what happens if someone tries to call back in
+    // exploiter places a real bet, wins, claims, tries to claim again
+    // -----------------------------------------------------------------------
+    function testFuzz_reentrancyBlocked(uint96 stake) public {
         vm.assume(stake > 0.001 ether && stake <= 5 ether);
 
-        (uint256 id, uint256 resolution) = _createMarket();
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        // Attacker places bet
-        vm.prank(attacker);
-        market.placeBet{value: stake}(id, 0, stake, 0);
+        vm.prank(exploiter);
+        betting.placeBet{value: stake}(id, 0, stake, 0);
 
-        vm.warp(resolution + 1);
+        vm.warp(closesAt + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
 
-        uint256 betId = market.getUserBets(attacker)[0];
+        uint256 betId = betting.getUserBets(exploiter)[0];
 
-        // First claim succeeds
-        vm.prank(attacker);
-        market.claimWinnings(betId);
+        vm.prank(exploiter);
+        betting.claimWinnings(betId); // legitimate first claim
 
-        // Second claim (simulated reentrant call) reverts
-        vm.prank(attacker);
+        // this is what a reentrant call would look like - should revert
+        vm.prank(exploiter);
         vm.expectRevert(WorldCupBettingHardened.AlreadyClaimed.selector);
-        market.claimWinnings(betId);
+        betting.claimWinnings(betId);
     }
 
-    // ── Fuzz: time-lock enforcement ────────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // time checks
+    // -----------------------------------------------------------------------
 
-    function testFuzz_cannotResolveBeforeTime(uint32 timeLeft) public {
+    // oracle can't resolve early no matter what
+    function testFuzz_tooEarlyToResolve(uint32 timeLeft) public {
         vm.assume(timeLeft > 1);
-        uint256 resolution = block.timestamp + timeLeft;
+        uint256 closesAt = block.timestamp + timeLeft;
 
-        string[] memory outcomes = new string[](2);
-        outcomes[0] = "YES"; outcomes[1] = "NO";
-        uint256 id = market.createMarket(
-            "Q", "D", outcomes, resolution, oracle, address(0)
-        );
+        string[] memory opts = new string[](2);
+        opts[0] = "YES";
+        opts[1] = "NO";
+        uint256 id = betting.createMarket("Q", "D", opts, closesAt, oracle, address(0));
 
-        vm.warp(resolution - 1);
+        vm.warp(closesAt - 1);
         vm.prank(oracle);
         vm.expectRevert(WorldCupBettingHardened.TooEarly.selector);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
     }
 
-    /// @notice Bets are rejected at or after resolutionTime
-    function testFuzz_noBetsAfterClose(uint32 delay) public {
-        vm.assume(delay <= RESOLUTION_OFFSET);
-        (uint256 id, uint256 resolution) = _createMarket();
+    // no bets after market closes
+    function testFuzz_noBetsAfterDeadline(uint32 delay) public {
+        vm.assume(delay <= ONE_WEEK);
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        vm.warp(resolution + delay);
+        vm.warp(closesAt + delay);
 
-        vm.prank(alice);
+        vm.prank(marcos);
         vm.expectRevert(WorldCupBettingHardened.MarketClosed.selector);
-        market.placeBet{value: 0.1 ether}(id, 0, 0.1 ether, 0);
+        betting.placeBet{value: 0.1 ether}(id, 0, 0.1 ether, 0);
     }
 
-    // ── Fuzz: access control ──────────────────────────────────────────────────
-
-    function testFuzz_onlyArbitratorCanResolve(address rando) public {
+    // -----------------------------------------------------------------------
+    // access control - random addresses should never be able to resolve
+    // -----------------------------------------------------------------------
+    function testFuzz_randomCantResolve(address rando) public {
         vm.assume(rando != oracle && rando != address(0));
-        (uint256 id, uint256 resolution) = _createMarket();
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        vm.warp(resolution + 1);
+        vm.warp(closesAt + 1);
         vm.prank(rando);
         vm.expectRevert(WorldCupBettingHardened.OnlyArbitrator.selector);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
     }
 
-    // ── Fuzz: fee accounting ──────────────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // fees - always exactly 2%, never more than the pool
+    // -----------------------------------------------------------------------
+    function testFuzz_feeIsAlways2Percent(uint96 stakeBrazil, uint96 stakeArgentina) public {
+        vm.assume(stakeBrazil > 0.001 ether && stakeBrazil <= 5 ether);
+        vm.assume(stakeArgentina > 0.001 ether && stakeArgentina <= 5 ether);
 
-    function testFuzz_feeNeverExceedsPool(uint96 stakeA, uint96 stakeB) public {
-        vm.assume(stakeA > 0.001 ether && stakeA <= 5 ether);
-        vm.assume(stakeB > 0.001 ether && stakeB <= 5 ether);
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        (uint256 id, uint256 resolution) = _createMarket();
+        vm.prank(marcos);
+        betting.placeBet{value: stakeBrazil}(id, 0, stakeBrazil, 0);
+        vm.prank(priya);
+        betting.placeBet{value: stakeArgentina}(id, 1, stakeArgentina, 0);
 
-        vm.prank(alice);
-        market.placeBet{value: stakeA}(id, 0, stakeA, 0);
-        vm.prank(bob);
-        market.placeBet{value: stakeB}(id, 1, stakeB, 0);
-
-        vm.warp(resolution + 1);
+        vm.warp(closesAt + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
 
-        uint256 betId = market.getUserBets(alice)[0];
-        vm.prank(alice);
-        market.claimWinnings(betId);
+        uint256 betId = betting.getUserBets(marcos)[0];
+        vm.prank(marcos);
+        betting.claimWinnings(betId);
 
-        uint256 fees = market.getAvailableFees(address(0));
-        uint256 totalPool = uint256(stakeA) + uint256(stakeB);
-        assertLe(fees, totalPool, "Fees exceed total pool");
-        // 2% fee
-        uint256 expectedFee = (totalPool * 200) / 10_000;
-        assertEq(fees, expectedFee, "Fee not exactly 2%");
+        uint256 pot = uint256(stakeBrazil) + uint256(stakeArgentina);
+        uint256 fees = betting.getAvailableFees(address(0));
+
+        assertLe(fees, pot);
+        assertEq(fees, (pot * 200) / 10_000, "fee should be exactly 2%");
     }
 
-    // ── Invariant: contract ETH balance always covers unclaimed winnings ───────
+    // -----------------------------------------------------------------------
+    // invariant: after a claim, contract balance == remaining fees only
+    // -----------------------------------------------------------------------
+    function testFuzz_balanceEqualsFeesAfterClaim(uint96 stakeHome, uint96 stakeAway) public {
+        vm.assume(stakeHome > 0.001 ether && stakeHome <= 3 ether);
+        vm.assume(stakeAway > 0.001 ether && stakeAway <= 3 ether);
 
-    function testFuzz_contractBalanceCoversPayouts(uint96 s1, uint96 s2) public {
-        vm.assume(s1 > 0.001 ether && s1 <= 3 ether);
-        vm.assume(s2 > 0.001 ether && s2 <= 3 ether);
+        (uint256 id, uint256 closesAt) = _openMarket();
 
-        (uint256 id, uint256 resolution) = _createMarket();
+        vm.prank(marcos);
+        betting.placeBet{value: stakeHome}(id, 0, stakeHome, 0);
+        vm.prank(priya);
+        betting.placeBet{value: stakeAway}(id, 1, stakeAway, 0);
 
-        vm.prank(alice);
-        market.placeBet{value: s1}(id, 0, s1, 0);
-        vm.prank(bob);
-        market.placeBet{value: s2}(id, 1, s2, 0);
+        assertEq(address(betting).balance, uint256(stakeHome) + uint256(stakeAway));
 
-        uint256 contractBalBefore = address(market).balance;
-        assertEq(contractBalBefore, uint256(s1) + uint256(s2));
-
-        vm.warp(resolution + 1);
+        vm.warp(closesAt + 1);
         vm.prank(oracle);
-        market.resolveMarket(id, 0);
+        betting.resolveMarket(id, 0);
 
-        uint256 betId = market.getUserBets(alice)[0];
-        vm.prank(alice);
-        market.claimWinnings(betId);
+        uint256 betId = betting.getUserBets(marcos)[0];
+        vm.prank(marcos);
+        betting.claimWinnings(betId);
 
-        // After payout, contract holds only fees
-        uint256 fees = market.getAvailableFees(address(0));
-        assertEq(address(market).balance, fees);
+        // only fees should remain in contract
+        uint256 fees = betting.getAvailableFees(address(0));
+        assertEq(address(betting).balance, fees);
     }
 }
